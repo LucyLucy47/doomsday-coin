@@ -141,6 +141,27 @@ footer a:hover {
 }
 .hero-projects li {
   margin: 0.25rem 0;
+  /* Lighten the text colour of project list items for better contrast */
+  color: #f2f3f8;
+}
+
+/* Ensure links in the hero projects list contrast clearly with the dark background */
+.hero-projects a {
+  /* Brighten link colour for maximum contrast */
+  color: #73ffee;
+  text-decoration: none;
+  font-weight: bold;
+}
+
+.hero-projects a:hover {
+  /* Slightly lighter on hover */
+  color: #a6faff;
+  text-decoration: underline;
+}
+
+/* Lighten hero paragraph text so it remains legible against the dark cosmic background */
+.hero p {
+  color: #f2f3f8;
 }
 
 /* Secondary button style */
