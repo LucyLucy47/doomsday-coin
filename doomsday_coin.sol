@@ -1,282 +1,765 @@
 // SPDX-License-Identifier: MIT
-/*
- *  Doomsday Coin (DDC) Proof‑of‑Concept Smart Contract
- *
- *  This smart contract implements a simplified version of the Doomsday Coin
- *  described in the MUAI foundation white paper (V3.0). It illustrates
- *  several of the key ideas articulated in the document including: a
- *  fixed and indivisible total supply, human‑only ownership, automatic
- *  redistribution when non‑human accounts are detected, and the ability
- *  to gradually sell previously uncirculated shares. For brevity and
- *  readability, sensitive biometric and AI‑based verifications are not
- *  implemented on‑chain. In a production deployment these checks would be
- *  handled off‑chain through decentralized identity systems and oracles.
- */
-
 pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
 /**
  * @title DoomsdayCoin
- * @dev Minimal ERC‑20–like token with fixed supply of one unit (1 * 10^18
- * decimals). The contract owner may release unsold shares, flag addresses as
- * ineligible (simulating detection of corporate or AI accounts), and
- * redistribute their holdings to legitimate human participants. The contract
- * also includes a simple transfer function that enforces the human‑only rule.
+ * @notice Production-ready implementation with founder allocation
+ * @dev Total supply: 1 DDC | Founders: 0.2 DDC | Public: 0.8 DDC
  */
-contract DoomsdayCoin {
-    // Token metadata
-    string public constant name = "Doomsday Coin";
-    string public constant symbol = "DDC";
-    uint8 public constant decimals = 18;
-
-    // The total supply is one whole coin represented with 18 decimals.
-    uint256 public constant totalSupply = 1e18;
-
-    // Address of the contract administrator (e.g. MUAI foundation). Only the
-    // admin can perform privileged operations such as releasing new shares
-    // or flagging non‑human accounts. In a production system this could be
-    // replaced by a decentralized governance mechanism.
-    address public admin;
-
-    // Track balances of each holder
-    mapping(address => uint256) private balances;
-    // Track allowances for ERC‑20 compatibility
-    mapping(address => mapping(address => uint256)) private allowances;
-
-    // Reserve of unsold shares that have not yet been issued. Initially
-    // the entire supply resides in the reserve. When `releaseShares()` is
-    // called, a portion of the reserve is minted to a specified recipient
-    // (e.g. a sale contract or individual). Remaining tokens stay locked in
-    // reserve until future releases.
-    uint256 public reserve;
-
-    // List of current token holders. Historically this contract maintained a
-    // simple array of holders and iterated through it to redistribute balances.
-    // This design was vulnerable to denial‑of‑service attacks because a
-    // malicious actor could fragment the coin into many tiny balances,
-    // causing on‑chain loops to exhaust gas. In this improved version, the
-    // holders array still tracks addresses for informational purposes, but
-    // seized balances are returned to the reserve instead of being
-    // redistributed on‑chain. We also track each holder’s index to enable
-    // O(1) removal when their balance drops to zero.
-    address[] private holders;
-    mapping(address => bool) private isHolder;
-    mapping(address => uint256) private holderIndex;
-
-    // Mapping of flagged addresses that are considered non‑human. Once
-    // flagged, an address cannot receive tokens and its balance will be
-    // redistributed. Only the admin may flag accounts.
-    mapping(address => bool) public flagged;
-
-    // Events for transparency
+contract DoomsdayCoin is ReentrancyGuard, Pausable, AccessControl, Initializable {
+    
+    // ============ Constants ============
+    
+    string public constant NAME = "Doomsday Coin";
+    string public constant SYMBOL = "DDC";
+    uint8 public constant DECIMALS = 18;
+    uint256 public constant TOTAL_SUPPLY = 1e18; // 1 coin
+    uint256 public constant FOUNDER_ALLOCATION = 2e17; // 0.2 coin (20%)
+    uint256 public constant PUBLIC_ALLOCATION = 8e17; // 0.8 coin (80%)
+    
+    // Role definitions
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant VERIFIER_ROLE = keccak256("VERIFIER_ROLE");
+    bytes32 public constant BRIDGE_ROLE = keccak256("BRIDGE_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant FOUNDER_ROLE = keccak256("FOUNDER_ROLE");
+    
+    // Time-lock period for critical operations (24 hours)
+    uint256 public constant TIMELOCK_PERIOD = 24 hours;
+    
+    // Vesting period for founders (2 years)
+    uint256 public constant VESTING_PERIOD = 730 days;
+    
+    // Cliff period (6 months before any vesting)
+    uint256 public constant CLIFF_PERIOD = 180 days;
+    
+    // ============ State Variables ============
+    
+    // Token balances
+    mapping(address => uint256) private _balances;
+    
+    // Token allowances
+    mapping(address => mapping(address => uint256)) private _allowances;
+    
+    // Public reserve (0.8 DDC available for distribution)
+    uint256 public publicReserve;
+    
+    // Founder reserve (0.2 DDC for founders)
+    uint256 public founderReserve;
+    
+    // Circulating supply (released from reserves)
+    uint256 public circulatingSupply;
+    
+    // Founder vesting tracking
+    struct FounderVesting {
+        uint256 totalAllocation;
+        uint256 claimed;
+        uint256 startTime;
+        bool initialized;
+    }
+    mapping(address => FounderVesting) public founderVesting;
+    address[] public founders;
+    uint256 public totalFoundersClaimed;
+    
+    // Holder tracking
+    address[] private _holders;
+    mapping(address => bool) private _isHolder;
+    mapping(address => uint256) private _holderIndex;
+    
+    // Verification system
+    enum VerificationStatus {
+        Unverified,
+        Pending,
+        Verified,
+        Flagged
+    }
+    mapping(address => VerificationStatus) public verificationStatus;
+    mapping(address => uint256) public lastVerificationTime;
+    uint256 public verificationExpiry = 180 days;
+    
+    // Time-locked operations
+    struct TimeLockOperation {
+        uint256 executeAfter;
+        bool executed;
+        bytes data;
+    }
+    mapping(bytes32 => TimeLockOperation) public timeLockedOps;
+    
+    // Multi-chain support
+    uint256 public chainId;
+    mapping(uint256 => bool) public supportedChains;
+    mapping(bytes32 => bool) public processedBridgeTransactions;
+    
+    // Contract deployment time
+    uint256 public immutable deploymentTime;
+    
+    // ============ Events ============
+    
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
-    event Flagged(address indexed account, uint256 balanceRedistributed);
-    event SharesReleased(address indexed to, uint256 amount);
-
-    /**
-     * @dev Event emitted when seized tokens are returned to the reserve. In the
-     * improved contract, flagged or deceased accounts have their balances
-     * added back to the reserve instead of being redistributed on‑chain to
-     * avoid expensive loops.
-     */
-    event TokensSeized(address indexed account, uint256 amount);
-
-    /**
-     * @dev Initialize the contract, setting the deployer as admin and
-     * placing the entire supply in reserve.
-     */
-    constructor() {
-        admin = msg.sender;
-        reserve = totalSupply;
-    }
-
-    /**
-     * @dev Modifier to restrict functions to the contract admin.
-     */
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Only admin can perform this action");
+    
+    event SharesReleased(address indexed to, uint256 amount, uint256 newCirculatingSupply);
+    event TokensSeized(address indexed account, uint256 amount, string reason);
+    
+    event AccountVerified(address indexed account, address indexed verifier);
+    event AccountFlagged(address indexed account, address indexed flagger, string reason);
+    event VerificationExpired(address indexed account);
+    
+    event OperationScheduled(bytes32 indexed opHash, uint256 executeAfter);
+    event OperationExecuted(bytes32 indexed opHash);
+    event OperationCancelled(bytes32 indexed opHash);
+    
+    event BridgeTransfer(
+        address indexed from,
+        uint256 amount,
+        uint256 indexed toChainId,
+        bytes32 indexed txHash
+    );
+    event BridgeReceive(
+        address indexed to,
+        uint256 amount,
+        uint256 indexed fromChainId,
+        bytes32 indexed txHash
+    );
+    
+    event FounderAdded(address indexed founder, uint256 allocation);
+    event FounderVestingClaimed(address indexed founder, uint256 amount, uint256 totalClaimed);
+    
+    // ============ Modifiers ============
+    
+    modifier onlyVerified() {
+        require(
+            verificationStatus[msg.sender] == VerificationStatus.Verified,
+            "DDC: Account not verified"
+        );
+        require(
+            block.timestamp <= lastVerificationTime[msg.sender] + verificationExpiry,
+            "DDC: Verification expired"
+        );
         _;
     }
-
+    
+    modifier notFlagged(address account) {
+        require(
+            verificationStatus[account] != VerificationStatus.Flagged,
+            "DDC: Account is flagged"
+        );
+        _;
+    }
+    
+    // ============ Constructor & Initialization ============
+    
+    constructor(address initialAdmin) {
+        require(initialAdmin != address(0), "DDC: Invalid admin address");
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
+        _grantRole(ADMIN_ROLE, initialAdmin);
+        _grantRole(PAUSER_ROLE, initialAdmin);
+        
+        chainId = block.chainid;
+        publicReserve = PUBLIC_ALLOCATION; // 0.8 DDC
+        founderReserve = FOUNDER_ALLOCATION; // 0.2 DDC
+        circulatingSupply = 0;
+        
+        deploymentTime = block.timestamp;
+    }
+    
     /**
-     * @dev Returns the balance of an account.
-     * @param account The address to query the balance of.
+     * @dev Initialize founder allocations with equal distribution
+     * @param founderAddresses Array of founder addresses
      */
+    function initializeFounders(address[] calldata founderAddresses) 
+        external 
+        onlyRole(ADMIN_ROLE)
+    {
+        require(founders.length == 0, "DDC: Founders already initialized");
+        require(founderAddresses.length > 0, "DDC: No founders provided");
+        require(founderAddresses.length <= 10, "DDC: Too many founders");
+        
+        uint256 allocationPerFounder = FOUNDER_ALLOCATION / founderAddresses.length;
+        
+        for (uint256 i = 0; i < founderAddresses.length; i++) {
+            address founder = founderAddresses[i];
+            require(founder != address(0), "DDC: Invalid founder address");
+            require(!founderVesting[founder].initialized, "DDC: Founder already added");
+            
+            founders.push(founder);
+            founderVesting[founder] = FounderVesting({
+                totalAllocation: allocationPerFounder,
+                claimed: 0,
+                startTime: block.timestamp,
+                initialized: true
+            });
+            
+            _grantRole(FOUNDER_ROLE, founder);
+            
+            // Auto-verify founders
+            verificationStatus[founder] = VerificationStatus.Verified;
+            lastVerificationTime[founder] = block.timestamp;
+            
+            emit FounderAdded(founder, allocationPerFounder);
+            emit AccountVerified(founder, msg.sender);
+        }
+    }
+    
+    /**
+     * @dev Initialize supported chains
+     */
+    function initializeSupportedChains(uint256[] calldata chains) 
+        external 
+        onlyRole(ADMIN_ROLE) 
+    {
+        for (uint256 i = 0; i < chains.length; i++) {
+            supportedChains[chains[i]] = true;
+        }
+    }
+    
+    // ============ ERC-20 Core Functions ============
+    
+    function name() public pure returns (string memory) {
+        return NAME;
+    }
+    
+    function symbol() public pure returns (string memory) {
+        return SYMBOL;
+    }
+    
+    function decimals() public pure returns (uint8) {
+        return DECIMALS;
+    }
+    
+    function totalSupply() public pure returns (uint256) {
+        return TOTAL_SUPPLY;
+    }
+    
     function balanceOf(address account) public view returns (uint256) {
-        return balances[account];
+        return _balances[account];
     }
-
-    /**
-     * @dev Internal function to add a new holder to the list. This keeps the
-     * holders array up to date for redistribution. It is called whenever
-     * tokens are transferred to an address that previously had zero balance.
-     */
-    function _addHolder(address account) internal {
-        if (!isHolder[account]) {
-            isHolder[account] = true;
-            holderIndex[account] = holders.length;
-            holders.push(account);
-        }
+    
+    function allowance(address owner, address spender) public view returns (uint256) {
+        return _allowances[owner][spender];
     }
-
-    /**
-     * @dev Internal function to remove a holder from the list when their
-     * balance becomes zero. Uses the holderIndex mapping to swap and pop in
-     * O(1) time.
-     */
-    function _removeHolder(address account) internal {
-        if (!isHolder[account]) {
-            return;
-        }
-        uint256 index = holderIndex[account];
-        uint256 lastIndex = holders.length - 1;
-        address lastHolder = holders[lastIndex];
-        // Move the last holder into the spot to delete
-        holders[index] = lastHolder;
-        holderIndex[lastHolder] = index;
-        // Remove the last element
-        holders.pop();
-        isHolder[account] = false;
-        // Note: holderIndex[account] retains its old value but is ignored
-    }
-
-    /**
-     * @dev Transfer tokens to another address. Transfers are blocked if
-     * either the sender or recipient is flagged as non‑human. Upon a
-     * successful transfer, the recipient is recorded in the holders list if
-     * they were not already present.
-     * @param to Recipient address
-     * @param value Amount to transfer (in smallest units)
-     * @return True on success
-     */
-    function transfer(address to, uint256 value) public returns (bool) {
-        require(!flagged[msg.sender], "Sender address is flagged as ineligible");
-        require(!flagged[to], "Recipient address is flagged as ineligible");
-        require(balances[msg.sender] >= value, "Insufficient balance");
-
-        balances[msg.sender] -= value;
-        balances[to] += value;
-        if (!isHolder[to]) {
-            _addHolder(to);
-        }
-        if (balances[msg.sender] == 0) {
-            _removeHolder(msg.sender);
-        }
-        emit Transfer(msg.sender, to, value);
+    
+    function transfer(address to, uint256 amount) 
+        public 
+        virtual 
+        whenNotPaused 
+        nonReentrant
+        onlyVerified
+        notFlagged(to)
+        returns (bool) 
+    {
+        _transfer(msg.sender, to, amount);
         return true;
     }
-
-    /**
-     * @dev Approve another address to spend tokens on your behalf. ERC‑20
-     * compatibility is provided for interoperability with DeFi protocols.
-     * @param spender Address allowed to spend
-     * @param value Maximum amount they can spend
-     * @return True on success
-     */
-    function approve(address spender, uint256 value) public returns (bool) {
-        require(!flagged[msg.sender], "Owner address is flagged");
-        allowances[msg.sender][spender] = value;
-        emit Approval(msg.sender, spender, value);
+    
+    function approve(address spender, uint256 amount) 
+        public 
+        virtual 
+        whenNotPaused
+        onlyVerified
+        returns (bool) 
+    {
+        _approve(msg.sender, spender, amount);
         return true;
     }
-
-    /**
-     * @dev Transfer tokens on behalf of another address. The sender must have
-     * sufficient allowance and both the owner and recipient must be
-     * unflagged.
-     */
-    function transferFrom(address from, address to, uint256 value) public returns (bool) {
-        require(!flagged[from], "From address is flagged as ineligible");
-        require(!flagged[to], "Recipient address is flagged as ineligible");
-        require(allowances[from][msg.sender] >= value, "Allowance exceeded");
-        require(balances[from] >= value, "Insufficient balance");
-
-        allowances[from][msg.sender] -= value;
-        balances[from] -= value;
-        balances[to] += value;
-        if (!isHolder[to]) {
+    
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        virtual
+        whenNotPaused
+        nonReentrant
+        notFlagged(from)
+        notFlagged(to)
+        returns (bool)
+    {
+        _spendAllowance(from, msg.sender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+    
+    function increaseAllowance(address spender, uint256 addedValue)
+        public
+        virtual
+        whenNotPaused
+        onlyVerified
+        returns (bool)
+    {
+        _approve(msg.sender, spender, _allowances[msg.sender][spender] + addedValue);
+        return true;
+    }
+    
+    function decreaseAllowance(address spender, uint256 subtractedValue)
+        public
+        virtual
+        whenNotPaused
+        onlyVerified
+        returns (bool)
+    {
+        uint256 currentAllowance = _allowances[msg.sender][spender];
+        require(currentAllowance >= subtractedValue, "DDC: Decreased below zero");
+        unchecked {
+            _approve(msg.sender, spender, currentAllowance - subtractedValue);
+        }
+        return true;
+    }
+    
+    // ============ Internal Transfer Logic ============
+    
+    function _transfer(address from, address to, uint256 amount) internal {
+        require(from != address(0), "DDC: Transfer from zero address");
+        require(to != address(0), "DDC: Transfer to zero address");
+        require(_balances[from] >= amount, "DDC: Insufficient balance");
+        
+        require(
+            verificationStatus[to] == VerificationStatus.Verified &&
+            block.timestamp <= lastVerificationTime[to] + verificationExpiry,
+            "DDC: Recipient not verified or expired"
+        );
+        
+        unchecked {
+            _balances[from] -= amount;
+            _balances[to] += amount;
+        }
+        
+        if (_balances[to] > 0 && !_isHolder[to]) {
             _addHolder(to);
         }
-        if (balances[from] == 0) {
+        if (_balances[from] == 0 && _isHolder[from]) {
             _removeHolder(from);
         }
-        emit Transfer(from, to, value);
-        return true;
+        
+        emit Transfer(from, to, amount);
     }
-
-    /**
-     * @dev Returns the remaining allowance a spender has on an owner's
-     * account.
-     */
-    function allowance(address owner_, address spender) public view returns (uint256) {
-        return allowances[owner_][spender];
+    
+    function _approve(address owner, address spender, uint256 amount) internal {
+        require(owner != address(0), "DDC: Approve from zero address");
+        require(spender != address(0), "DDC: Approve to zero address");
+        
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
     }
-
+    
+    function _spendAllowance(address owner, address spender, uint256 amount) internal {
+        uint256 currentAllowance = _allowances[owner][spender];
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "DDC: Insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+    
+    // ============ Holder Management ============
+    
+    function _addHolder(address account) internal {
+        if (!_isHolder[account]) {
+            _isHolder[account] = true;
+            _holderIndex[account] = _holders.length;
+            _holders.push(account);
+        }
+    }
+    
+    function _removeHolder(address account) internal {
+        if (!_isHolder[account]) {
+            return;
+        }
+        
+        uint256 index = _holderIndex[account];
+        uint256 lastIndex = _holders.length - 1;
+        
+        if (index != lastIndex) {
+            address lastHolder = _holders[lastIndex];
+            _holders[index] = lastHolder;
+            _holderIndex[lastHolder] = index;
+        }
+        
+        _holders.pop();
+        _isHolder[account] = false;
+    }
+    
+    function getHolders() external view returns (address[] memory) {
+        return _holders;
+    }
+    
+    function getHolderCount() external view returns (uint256) {
+        return _holders.length;
+    }
+    
+    // ============ Founder Vesting ============
+    
     /**
-     * @dev Admin function to release a portion of the reserved supply to a
-     * recipient. This simulates the "new coin sale" described in the
-     * white paper. When new shares are released, existing holders' balances
-     * remain unchanged but their relative ownership decreases. The amount
-     * released must not exceed the reserve.
-     * @param to Address receiving the newly released tokens
-     * @param amount Amount to release (in smallest units)
+     * @dev Calculate vested amount for a founder
      */
-    function releaseShares(address to, uint256 amount) external onlyAdmin {
-        require(amount > 0, "Amount must be greater than zero");
-        require(amount <= reserve, "Not enough reserve available");
-        require(!flagged[to], "Recipient is flagged as ineligible");
-
-        reserve -= amount;
-        balances[to] += amount;
-        if (!isHolder[to]) {
+    function calculateVestedAmount(address founder) public view returns (uint256) {
+        FounderVesting memory vesting = founderVesting[founder];
+        
+        if (!vesting.initialized) {
+            return 0;
+        }
+        
+        uint256 elapsedTime = block.timestamp - vesting.startTime;
+        
+        // Before cliff, nothing is vested
+        if (elapsedTime < CLIFF_PERIOD) {
+            return 0;
+        }
+        
+        // After full vesting period, everything is vested
+        if (elapsedTime >= VESTING_PERIOD) {
+            return vesting.totalAllocation;
+        }
+        
+        // Linear vesting after cliff
+        uint256 vestedAmount = (vesting.totalAllocation * elapsedTime) / VESTING_PERIOD;
+        return vestedAmount;
+    }
+    
+    /**
+     * @dev Calculate claimable amount (vested - already claimed)
+     */
+    function calculateClaimableAmount(address founder) public view returns (uint256) {
+        uint256 vested = calculateVestedAmount(founder);
+        uint256 claimed = founderVesting[founder].claimed;
+        
+        if (vested <= claimed) {
+            return 0;
+        }
+        
+        return vested - claimed;
+    }
+    
+    /**
+     * @dev Founder claims their vested tokens
+     */
+    function claimFounderTokens() external onlyRole(FOUNDER_ROLE) nonReentrant {
+        address founder = msg.sender;
+        uint256 claimable = calculateClaimableAmount(founder);
+        
+        require(claimable > 0, "DDC: No tokens to claim");
+        require(founderReserve >= claimable, "DDC: Insufficient founder reserve");
+        
+        founderVesting[founder].claimed += claimable;
+        totalFoundersClaimed += claimable;
+        
+        unchecked {
+            founderReserve -= claimable;
+            circulatingSupply += claimable;
+            _balances[founder] += claimable;
+        }
+        
+        if (!_isHolder[founder]) {
+            _addHolder(founder);
+        }
+        
+        emit FounderVestingClaimed(founder, claimable, founderVesting[founder].claimed);
+        emit Transfer(address(0), founder, claimable);
+    }
+    
+    /**
+     * @dev Get all founders and their vesting info
+     */
+    function getFoundersInfo() external view returns (
+        address[] memory founderAddresses,
+        uint256[] memory totalAllocations,
+        uint256[] memory claimedAmounts,
+        uint256[] memory claimableAmounts
+    ) {
+        uint256 length = founders.length;
+        founderAddresses = new address[](length);
+        totalAllocations = new uint256[](length);
+        claimedAmounts = new uint256[](length);
+        claimableAmounts = new uint256[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            address founder = founders[i];
+            founderAddresses[i] = founder;
+            totalAllocations[i] = founderVesting[founder].totalAllocation;
+            claimedAmounts[i] = founderVesting[founder].claimed;
+            claimableAmounts[i] = calculateClaimableAmount(founder);
+        }
+        
+        return (founderAddresses, totalAllocations, claimedAmounts, claimableAmounts);
+    }
+    
+    // ============ Verification System ============
+    
+    function verifyAccount(address account) 
+        external 
+        onlyRole(VERIFIER_ROLE) 
+    {
+        require(account != address(0), "DDC: Invalid address");
+        require(
+            verificationStatus[account] != VerificationStatus.Flagged,
+            "DDC: Cannot verify flagged account"
+        );
+        
+        verificationStatus[account] = VerificationStatus.Verified;
+        lastVerificationTime[account] = block.timestamp;
+        
+        emit AccountVerified(account, msg.sender);
+    }
+    
+    function batchVerifyAccounts(address[] calldata accounts)
+        external
+        onlyRole(VERIFIER_ROLE)
+    {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            if (
+                accounts[i] != address(0) &&
+                verificationStatus[accounts[i]] != VerificationStatus.Flagged
+            ) {
+                verificationStatus[accounts[i]] = VerificationStatus.Verified;
+                lastVerificationTime[accounts[i]] = block.timestamp;
+                emit AccountVerified(accounts[i], msg.sender);
+            }
+        }
+    }
+    
+    function renewVerification() external {
+        require(
+            verificationStatus[msg.sender] == VerificationStatus.Verified,
+            "DDC: Not verified"
+        );
+        
+        lastVerificationTime[msg.sender] = block.timestamp;
+        emit AccountVerified(msg.sender, msg.sender);
+    }
+    
+    function isVerificationValid(address account) public view returns (bool) {
+        return verificationStatus[account] == VerificationStatus.Verified &&
+               block.timestamp <= lastVerificationTime[account] + verificationExpiry;
+    }
+    
+    // ============ Public Share Management ============
+    
+    /**
+     * @dev Release PUBLIC shares from reserve (not founder allocation)
+     */
+    function scheduleShareRelease(address to, uint256 amount)
+        external
+        onlyRole(ADMIN_ROLE)
+        returns (bytes32)
+    {
+        require(to != address(0), "DDC: Invalid recipient");
+        require(amount > 0, "DDC: Amount must be positive");
+        require(amount <= publicReserve, "DDC: Insufficient public reserve");
+        require(isVerificationValid(to), "DDC: Recipient not verified");
+        
+        bytes32 opHash = keccak256(
+            abi.encodePacked("RELEASE", to, amount, block.timestamp)
+        );
+        
+        timeLockedOps[opHash] = TimeLockOperation({
+            executeAfter: block.timestamp + TIMELOCK_PERIOD,
+            executed: false,
+            data: abi.encode(to, amount)
+        });
+        
+        emit OperationScheduled(opHash, block.timestamp + TIMELOCK_PERIOD);
+        return opHash;
+    }
+    
+    function executeShareRelease(bytes32 opHash)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+    {
+        TimeLockOperation storage op = timeLockedOps[opHash];
+        require(op.executeAfter > 0, "DDC: Operation not found");
+        require(!op.executed, "DDC: Already executed");
+        require(block.timestamp >= op.executeAfter, "DDC: Time-lock active");
+        
+        op.executed = true;
+        
+        (address to, uint256 amount) = abi.decode(op.data, (address, uint256));
+        
+        require(amount <= publicReserve, "DDC: Insufficient public reserve");
+        require(isVerificationValid(to), "DDC: Recipient verification expired");
+        
+        unchecked {
+            publicReserve -= amount;
+            circulatingSupply += amount;
+            _balances[to] += amount;
+        }
+        
+        if (!_isHolder[to]) {
             _addHolder(to);
         }
-        emit SharesReleased(to, amount);
+        
+        emit SharesReleased(to, amount, circulatingSupply);
+        emit Transfer(address(0), to, amount);
+        emit OperationExecuted(opHash);
+    }
+    
+    function cancelOperation(bytes32 opHash)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        TimeLockOperation storage op = timeLockedOps[opHash];
+        require(op.executeAfter > 0, "DDC: Operation not found");
+        require(!op.executed, "DDC: Already executed");
+        
+        delete timeLockedOps[opHash];
+        emit OperationCancelled(opHash);
+    }
+    
+    // ============ Account Management ============
+    
+    function flagAccount(address account, string calldata reason)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+    {
+        require(account != address(0), "DDC: Invalid address");
+        require(
+            verificationStatus[account] != VerificationStatus.Flagged,
+            "DDC: Already flagged"
+        );
+        
+        uint256 seized = _balances[account];
+        verificationStatus[account] = VerificationStatus.Flagged;
+        
+        if (seized > 0) {
+            _balances[account] = 0;
+            unchecked {
+                publicReserve += seized;
+                circulatingSupply -= seized;
+            }
+            _removeHolder(account);
+            
+            emit TokensSeized(account, seized, reason);
+            emit Transfer(account, address(0), seized);
+        }
+        
+        emit AccountFlagged(account, msg.sender, reason);
+    }
+    
+    function processInheritance(address deceased)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+    {
+        require(deceased != address(0), "DDC: Invalid address");
+        require(
+            verificationStatus[deceased] != VerificationStatus.Flagged,
+            "DDC: Account already flagged"
+        );
+        
+        uint256 seized = _balances[deceased];
+        
+        if (seized > 0) {
+            _balances[deceased] = 0;
+            unchecked {
+                publicReserve += seized;
+                circulatingSupply -= seized;
+            }
+            _removeHolder(deceased);
+            
+            emit TokensSeized(deceased, seized, "Inheritance");
+            emit Transfer(deceased, address(0), seized);
+        }
+        
+        verificationStatus[deceased] = VerificationStatus.Flagged;
+    }
+    
+    // ============ Cross-Chain Bridge ============
+    
+    function bridgeToChain(uint256 amount, uint256 toChainId)
+        external
+        onlyVerified
+        nonReentrant
+    {
+        require(supportedChains[toChainId], "DDC: Chain not supported");
+        require(amount > 0, "DDC: Invalid amount");
+        require(_balances[msg.sender] >= amount, "DDC: Insufficient balance");
+        
+        bytes32 txHash = keccak256(
+            abi.encodePacked(msg.sender, amount, chainId, toChainId, block.timestamp)
+        );
+        
+        _balances[msg.sender] -= amount;
+        if (_balances[msg.sender] == 0) {
+            _removeHolder(msg.sender);
+        }
+        
+        emit BridgeTransfer(msg.sender, amount, toChainId, txHash);
+        emit Transfer(msg.sender, address(0), amount);
+    }
+    
+    function bridgeFromChain(
+        address to,
+        uint256 amount,
+        uint256 fromChainId,
+        bytes32 txHash
+    )
+        external
+        onlyRole(BRIDGE_ROLE)
+        nonReentrant
+    {
+        require(supportedChains[fromChainId], "DDC: Chain not supported");
+        require(!processedBridgeTransactions[txHash], "DDC: Already processed");
+        require(isVerificationValid(to), "DDC: Recipient not verified");
+        
+        processedBridgeTransactions[txHash] = true;
+        
+        _balances[to] += amount;
+        if (!_isHolder[to]) {
+            _addHolder(to);
+        }
+        
+        emit BridgeReceive(to, amount, fromChainId, txHash);
         emit Transfer(address(0), to, amount);
     }
-
-    /**
-     * @dev Admin function to flag an account as non‑human (e.g. corporate or
-     * AI agent). The flagged account's balance is burned and redistributed
-     * proportionally among all remaining human holders. Once flagged, the
-     * account cannot receive tokens in the future.
-     * @param account The address to flag
-     */
-    function flagAccount(address account) external onlyAdmin {
-        require(!flagged[account], "Account already flagged");
-        uint256 seized = balances[account];
-        flagged[account] = true;
-        balances[account] = 0;
-        if (seized > 0) {
-            reserve += seized;
-            emit TokensSeized(account, seized);
-            emit Transfer(account, address(0), seized);
-        }
-        _removeHolder(account);
-        emit Flagged(account, seized);
+    
+    // ============ Emergency Controls ============
+    
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
     }
-
-    /**
-     * @dev Admin function to simulate a death or end‑of‑civilization event
-     * by redistributing a deceased account's holdings among remaining
-     * participants. In a production environment this would be triggered by
-     * off‑chain proof of death/absence delivered via an oracle. Here the
-     * admin specifies the account to clear.
-     * @param account The deceased account
-     */
-    function redistributeOnDeath(address account) external onlyAdmin {
-        // A deceased account's balance is returned to the reserve. We do not
-        // redistribute on‑chain to avoid expensive loops. If the account is
-        // already flagged, it has been handled by flagAccount().
-        require(!flagged[account], "Account already flagged");
-        uint256 seized = balances[account];
-        balances[account] = 0;
-        if (seized > 0) {
-            reserve += seized;
-            emit TokensSeized(account, seized);
-            emit Transfer(account, address(0), seized);
-        }
-        _removeHolder(account);
+    
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    // ============ Configuration ============
+    
+    function setVerificationExpiry(uint256 newExpiry)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        require(newExpiry >= 30 days && newExpiry <= 365 days, "DDC: Invalid expiry");
+        verificationExpiry = newExpiry;
+    }
+    
+    // ============ View Functions ============
+    
+    function getContractInfo() external view returns (
+        uint256 totalSupply_,
+        uint256 publicReserve_,
+        uint256 founderReserve_,
+        uint256 circulatingSupply_,
+        uint256 holderCount_,
+        uint256 chainId_,
+        uint256 founderCount_
+    ) {
+        return (
+            TOTAL_SUPPLY,
+            publicReserve,
+            founderReserve,
+            circulatingSupply,
+            _holders.length,
+            chainId,
+            founders.length
+        );
+    }
+    
+    function getFounderCount() external view returns (uint256) {
+        return founders.length;
     }
 }
