@@ -24,15 +24,15 @@ header {
   border-bottom: 1px solid #2a2e45;
 }
 
-header .logo a {
+header .brand {
   color: #73ffee;
   text-decoration: none;
   font-size: 1.8rem;
   font-weight: bold;
 }
 
-header nav ul {
-  list-style: none;
+/* Navigation styling for updated header */
+header nav {
   display: flex;
   gap: 1.5rem;
   justify-content: flex-end;
@@ -50,7 +50,8 @@ header nav a:hover {
 }
 
 .hero {
-  background: url('../images/space.jpg') no-repeat center/cover;
+  /* Use root-level image path for GitHub Pages */
+  background: url('space.jpg') no-repeat center/cover;
   padding: 8rem 0;
   text-align: center;
 }
@@ -117,4 +118,29 @@ footer a {
 
 footer a:hover {
   text-decoration: underline;
+}
+
+/* Additional styles for the MUAI Foundation website restructure */
+
+/* List of projects in the home hero section */
+.hero-projects {
+  margin: 1rem 0 2rem;
+  padding-left: 1.25rem;
+}
+.hero-projects li {
+  margin: 0.25rem 0;
+}
+
+/* Secondary button style */
+.btn.secondary {
+  background: transparent;
+  border: 1px solid currentColor;
+}
+
+/* Card styling for project lists */
+.card {
+  background: rgba(255, 255, 255, 0.03);
+  padding: 1rem 1.25rem;
+  border-radius: 8px;
+  margin: 1rem 0;
 }
