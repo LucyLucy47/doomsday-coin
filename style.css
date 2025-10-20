@@ -68,13 +68,13 @@ header nav a:hover {
   font-size: 1.25rem;
   max-width: 700px;
   margin: 0 auto 2rem;
-  /* Lighten hero paragraph text */
-  color: #dfe6fb;
+  /* Use the MUAI accent colour for the hero tagline */
+  color: #73ffee;
 }
 
 /* Ensure home hero heading (h1) stands out on dark background */
 .hero h1 {
-  color: #f2f3f8;
+  color: #73ffee;
   text-shadow: 0 0 10px #73ffee;
   font-size: 3rem;
   margin-bottom: 1rem;
@@ -146,8 +146,8 @@ footer p {
 }
 .hero-projects li {
   margin: 0.25rem 0;
-  /* Lighten the text colour of project list items for better contrast */
-  color: #f2f3f8;
+  /* Use the MUAI accent colour for project list items to match the tagline */
+  color: #73ffee;
 }
 
 /* Ensure links in the hero projects list contrast clearly with the dark background */
