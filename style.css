@@ -166,8 +166,17 @@ footer a:hover {
 
 /* Secondary button style */
 .btn.secondary {
+  /* Use the MUAI turquoise colour for the secondary button to improve contrast */
   background: transparent;
-  border: 1px solid currentColor;
+  border: 1px solid #73ffee;
+  color: #73ffee;
+}
+
+/* Hover state for the secondary button to enhance contrast on interaction */
+.btn.secondary:hover {
+  background: rgba(115, 255, 238, 0.1);
+  color: #a6faff;
+  border-color: #a6faff;
 }
 
 /* Card styling for project lists */
