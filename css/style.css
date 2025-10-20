@@ -1,0 +1,121 @@
+/* Global resets */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+  background-color: #0a0f24;
+  color: #e5e7f1;
+  line-height: 1.6;
+}
+
+.container {
+  width: 90%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 0;
+}
+
+header {
+  background: rgba(0, 0, 0, 0.5);
+  border-bottom: 1px solid #2a2e45;
+}
+
+header .logo a {
+  color: #73ffee;
+  text-decoration: none;
+  font-size: 1.8rem;
+  font-weight: bold;
+}
+
+header nav ul {
+  list-style: none;
+  display: flex;
+  gap: 1.5rem;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+header nav a {
+  color: #e5e7f1;
+  text-decoration: none;
+  transition: color 0.3s ease;
+}
+
+header nav a:hover {
+  color: #73ffee;
+}
+
+.hero {
+  /* Use root-level image path for GitHub Pages */
+  background: url('space.jpg') no-repeat center/cover;
+  padding: 8rem 0;
+  text-align: center;
+}
+
+.hero h2 {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+  text-shadow: 0 0 10px #73ffee;
+}
+
+.hero p {
+  font-size: 1.25rem;
+  max-width: 700px;
+  margin: 0 auto 2rem;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.75rem 2rem;
+  background: #73ffee;
+  color: #0a0f24;
+  border-radius: 50px;
+  text-decoration: none;
+  font-weight: bold;
+  transition: background 0.3s ease;
+}
+
+.btn:hover {
+  background: #52c0bd;
+}
+
+.features {
+  padding: 4rem 0;
+  background: #0f1531;
+}
+
+.features .feature {
+  margin-bottom: 2rem;
+}
+
+.features .feature h3 {
+  font-size: 1.5rem;
+  margin-bottom: 0.5rem;
+  color: #73ffee;
+}
+
+.features .feature p {
+  font-size: 1rem;
+  color: #c8cbdd;
+  max-width: 400px;
+}
+
+footer {
+  background: #0a0f24;
+  border-top: 1px solid #2a2e45;
+  text-align: center;
+  padding: 2rem 0;
+}
+
+footer a {
+  color: #73ffee;
+  text-decoration: none;
+}
+
+footer a:hover {
+  text-decoration: underline;
+}
