@@ -132,6 +132,11 @@ footer a:hover {
   text-decoration: underline;
 }
 
+/* Lighten the footer text for better contrast against dark backgrounds */
+footer p {
+  color: #f2f3f8;
+}
+
 /* Additional styles for the MUAI Foundation website restructure */
 
 /* List of projects in the home hero section */
