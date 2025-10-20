@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+interface IDoomsdayCoin {
+    function bridgeToChain(uint256 amount, uint256 toChainId) external;
+    function bridgeFromChain(address to, uint256 amount, uint256 fromChainId, bytes32 txHash) external;
+    function balanceOf(address account) external view returns (uint256);
+    function isVerificationValid(address account) external view returns (bool);
+}
+
+/**
+ * @title DDCBridge
+ * @notice Simple cross-chain bridge for Doomsday Coin without external dependencies
+ * @dev Uses a validator set to verify and execute cross-chain transfers
+ * 
+ * How it works:
+ * 1. User locks tokens on source chain
+ * 2. Validators observe and sign the lock event
+ * 3. Once threshold signatures collected, tokens are minted on destination
+ * 4. Validators must reach consensus (e.g., 3 of 5 validators)
+ */
+contract DDCBridge is ReentrancyGuard, AccessControl, Pausable {
+    
+    // ============ Constants & Roles ============
+    
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    
+    // Minimum validator signatures required
+    uint256 public signatureThreshold = 3;
+    
+    // Time window for validators to submit signatures (24 hours)
+    uint256 public constant SIGNATURE_WINDOW = 24 hours;
+    
+    // ============ State Variables ============
+    
+    IDoomsdayCoin public ddc;
+    uint256 public currentChainId;
+    
+    // Supported destination chains
+    mapping(uint256 => bool) public supportedChains;
+    mapping(uint256 => address) public bridgeContracts; // Chain ID => Bridge contract address
+    
+    // Bridge transfer tracking
+    struct BridgeTransfer {
+        address from;
+        address to;
+        uint256 amount;
+        uint256 fromChainId;
+        uint256 toChainId;
+        uint256 timestamp;
+        bool executed;
+        uint256 signatureCount;
+        mapping(address => bool) validatorSigned;
+    }
+    
+    mapping(bytes32 => BridgeTransfer) public bridgeTransfers;
+    
+    // Nonce for each user to prevent replay attacks
+    mapping(address => uint256) public userNonce;
+    
+    // Emergency withdrawal tracking
+    mapping(address => uint256) public pendingWithdrawals;
+    
+    // ============ Events ============
+    
+    event BridgeInitiated(
+        bytes32 indexed transferId,
+        address indexed from,
+        address indexed to,
+        uint256 amount,
+        uint256 fromChainId,
+        uint256 toChainId,
+        uint256 nonce
+    );
+    
+    event ValidatorSigned(
+        bytes32 indexed transferId,
+        address indexed validator,
+        uint256 signatureCount
+    );
+    
+    event BridgeCompleted(
+        bytes32 indexed transferId,
+        address indexed to,
+        uint256 amount,
+        uint256 fromChainId
+    );
+    
+    event BridgeChainAdded(uint256 indexed chainId, address indexed bridgeContract);
+    event BridgeChainRemoved(uint256 indexed chainId);
+    event SignatureThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
+    event EmergencyWithdrawal(address indexed user, uint256 amount);
+    
+    // ============ Constructor ============
+    
+    constructor(
+        address ddcAddress,
+        address admin,
+        uint256 _signatureThreshold
+    ) {
+        require(ddcAddress != address(0), "Bridge: Invalid DDC address");
+        require(admin != address(0), "Bridge: Invalid admin");
+        require(_signatureThreshold > 0, "Bridge: Invalid threshold");
+        
+        ddc = IDoomsdayCoin(ddcAddress);
+        currentChainId = block.chainid;
+        signatureThreshold = _signatureThreshold;
+        
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(ADMIN_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+    }
+    
+    // ============ Bridge Functions ============
+    
+    /**
+     * @dev Initiate a bridge transfer to another chain
+     * @param to Recipient address on destination chain
+     * @param amount Amount of DDC to bridge
+     * @param toChainId Destination chain ID
+     */
+    function initiateBridge(
+        address to,
+        uint256 amount,
+        uint256 toChainId
+    )
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        require(to != address(0), "Bridge: Invalid recipient");
+        require(amount > 0, "Bridge: Invalid amount");
+        require(supportedChains[toChainId], "Bridge: Chain not supported");
+        require(toChainId != currentChainId, "Bridge: Cannot bridge to same chain");
+        require(ddc.balanceOf(msg.sender) >= amount, "Bridge: Insufficient balance");
+        require(ddc.isVerificationValid(msg.sender), "Bridge: Sender not verified");
+        require(ddc.isVerificationValid(to), "Bridge: Recipient not verified");
+        
+        // Increment nonce for replay protection
+        uint256 nonce = userNonce[msg.sender]++;
+        
+        // Generate unique transfer ID
+        bytes32 transferId = keccak256(
+            abi.encodePacked(
+                msg.sender,
+                to,
+                amount,
+                currentChainId,
+                toChainId,
+                nonce,
+                block.timestamp
+            )
+        );
+        
+        // Lock tokens on source chain
+        ddc.bridgeToChain(amount, toChainId);
+        
+        // Create bridge transfer record
+        BridgeTransfer storage transfer = bridgeTransfers[transferId];
+        transfer.from = msg.sender;
+        transfer.to = to;
+        transfer.amount = amount;
+        transfer.fromChainId = currentChainId;
+        transfer.toChainId = toChainId;
+        transfer.timestamp = block.timestamp;
+        transfer.executed = false;
+        transfer.signatureCount = 0;
+        
+        emit BridgeInitiated(
+            transferId,
+            msg.sender,
+            to,
+            amount,
+            currentChainId,
+            toChainId,
+            nonce
+        );
+    }
+    
+    /**
+     * @dev Validator signs a bridge transfer
+     * @param transferId Unique identifier for the transfer
+     * @param from Original sender address
+     * @param to Recipient address
+     * @param amount Amount being transferred
+     * @param fromChainId Source chain ID
+     * @param toChainId Destination chain ID
+     * @param nonce User's nonce at time of transfer
+     * @param timestamp Original transfer timestamp
+     */
+    function signTransfer(
+        bytes32 transferId,
+        address from,
+        address to,
+        uint256 amount,
+        uint256 fromChainId,
+        uint256 toChainId,
+        uint256 nonce,
+        uint256 timestamp
+    )
+        external
+        onlyRole(VALIDATOR_ROLE)
+        whenNotPaused
+    {
+        // Verify this is for the correct destination chain
+        require(toChainId == currentChainId, "Bridge: Wrong destination chain");
+        
+        // Verify transfer ID matches the provided data
+        bytes32 expectedId = keccak256(
+            abi.encodePacked(from, to, amount, fromChainId, toChainId, nonce, timestamp)
+        );
+        require(transferId == expectedId, "Bridge: Transfer ID mismatch");
+        
+        BridgeTransfer storage transfer = bridgeTransfers[transferId];
+        
+        // Initialize if this is the first signature
+        if (transfer.timestamp == 0) {
+            transfer.from = from;
+            transfer.to = to;
+            transfer.amount = amount;
+            transfer.fromChainId = fromChainId;
+            transfer.toChainId = toChainId;
+            transfer.timestamp = timestamp;
+        } else {
+            // Verify existing transfer data matches
+            require(transfer.from == from, "Bridge: From mismatch");
+            require(transfer.to == to, "Bridge: To mismatch");
+            require(transfer.amount == amount, "Bridge: Amount mismatch");
+            require(transfer.fromChainId == fromChainId, "Bridge: FromChain mismatch");
+            require(transfer.toChainId == toChainId, "Bridge: ToChain mismatch");
+        }
+        
+        require(!transfer.executed, "Bridge: Already executed");
+        require(!transfer.validatorSigned[msg.sender], "Bridge: Already signed");
+        require(
+            block.timestamp <= timestamp + SIGNATURE_WINDOW,
+            "Bridge: Signature window expired"
+        );
+        
+        // Record signature
+        transfer.validatorSigned[msg.sender] = true;
+        transfer.signatureCount++;
+        
+        emit ValidatorSigned(transferId, msg.sender, transfer.signatureCount);
+        
+        // Execute if threshold reached
+        if (transfer.signatureCount >= signatureThreshold) {
+            _executeBridge(transferId);
+        }
+    }
+    
+    /**
+     * @dev Internal function to execute bridge transfer after threshold reached
+     */
+    function _executeBridge(bytes32 transferId) internal {
+        BridgeTransfer storage transfer = bridgeTransfers[transferId];
+        
+        require(!transfer.executed, "Bridge: Already executed");
+        require(transfer.signatureCount >= signatureThreshold, "Bridge: Insufficient signatures");
+        
+        transfer.executed = true;
+        
+        // Mint tokens on destination chain
+        ddc.bridgeFromChain(
+            transfer.to,
+            transfer.amount,
+            transfer.fromChainId,
+            transferId
+        );
+        
+        emit BridgeCompleted(
+            transferId,
+            transfer.to,
+            transfer.amount,
+            transfer.fromChainId
+        );
+    }
+    
+    /**
+     * @dev Emergency withdrawal if bridge fails
+     * Can only be called after signature window expires without reaching threshold
+     */
+    function emergencyWithdraw(bytes32 transferId)
+        external
+        nonReentrant
+    {
+        BridgeTransfer storage transfer = bridgeTransfers[transferId];
+        
+        require(transfer.from == msg.sender, "Bridge: Not transfer initiator");
+        require(!transfer.executed, "Bridge: Already executed");
+        require(
+            block.timestamp > transfer.timestamp + SIGNATURE_WINDOW,
+            "Bridge: Signature window still active"
+        );
+        require(
+            transfer.signatureCount < signatureThreshold,
+            "Bridge: Threshold reached"
+        );
+        
+        uint256 amount = transfer.amount;
+        transfer.executed = true; // Prevent re-entry
+        
+        pendingWithdrawals[msg.sender] += amount;
+        
+        emit EmergencyWithdrawal(msg.sender, amount);
+    }
+    
+    // ============ Admin Functions ============
+    
+    /**
+     * @dev Add a supported chain
+     */
+    function addSupportedChain(uint256 chainId, address bridgeContract)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        require(chainId != 0, "Bridge: Invalid chain ID");
+        require(bridgeContract != address(0), "Bridge: Invalid bridge contract");
+        
+        supportedChains[chainId] = true;
+        bridgeContracts[chainId] = bridgeContract;
+        
+        emit BridgeChainAdded(chainId, bridgeContract);
+    }
+    
+    /**
+     * @dev Remove a supported chain
+     */
+    function removeSupportedChain(uint256 chainId)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        supportedChains[chainId] = false;
+        delete bridgeContracts[chainId];
+        
+        emit BridgeChainRemoved(chainId);
+    }
+    
+    /**
+     * @dev Update signature threshold
+     */
+    function updateSignatureThreshold(uint256 newThreshold)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        require(newThreshold > 0, "Bridge: Invalid threshold");
+        
+        uint256 oldThreshold = signatureThreshold;
+        signatureThreshold = newThreshold;
+        
+        emit SignatureThresholdUpdated(oldThreshold, newThreshold);
+    }
+    
+    /**
+     * @dev Batch add validators
+     */
+    function addValidators(address[] calldata validators)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        for (uint256 i = 0; i < validators.length; i++) {
+            if (validators[i] != address(0)) {
+                grantRole(VALIDATOR_ROLE, validators[i]);
+            }
+        }
+    }
+    
+    /**
+     * @dev Batch remove validators
+     */
+    function removeValidators(address[] calldata validators)
+        external
+        onlyRole(ADMIN_ROLE)
+    {
+        for (uint256 i = 0; i < validators.length; i++) {
+            revokeRole(VALIDATOR_ROLE, validators[i]);
+        }
+    }
+    
+    // ============ Emergency Controls ============
+    
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+    
+    // ============ View Functions ============
+    
+    /**
+     * @dev Check if a validator has signed a transfer
+     */
+    function hasValidatorSigned(bytes32 transferId, address validator)
+        external
+        view
+        returns (bool)
+    {
+        return bridgeTransfers[transferId].validatorSigned[validator];
+    }
+    
+    /**
+     * @dev Get transfer details
+     */
+    function getTransferDetails(bytes32 transferId)
+        external
+        view
+        returns (
+            address from,
+            address to,
+            uint256 amount,
+            uint256 fromChainId,
+            uint256 toChainId,
+            uint256 timestamp,
+            bool executed,
+            uint256 signatureCount
+        )
+    {
+        BridgeTransfer storage transfer = bridgeTransfers[transferId];
+        return (
+            transfer.from,
+            transfer.to,
+            transfer.amount,
+            transfer.fromChainId,
+            transfer.toChainId,
+            transfer.timestamp,
+            transfer.executed,
+            transfer.signatureCount
+        );
+    }
+    
+    /**
+     * @dev Get current validator count
+     */
+    function getValidatorCount() external view returns (uint256) {
+        return getRoleMemberCount(VALIDATOR_ROLE);
+    }
+    
+    /**
+     * @dev Get validator by index
+     */
+    function getValidator(uint256 index) external view returns (address) {
+        return getRoleMember(VALIDATOR_ROLE, index);
+    }
+}
