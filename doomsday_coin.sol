@@ -50,13 +50,18 @@ contract DoomsdayCoin {
     // reserve until future releases.
     uint256 public reserve;
 
-    // List of current token holders. We maintain this list to redistribute
-    // balances when an ineligible account is flagged. This is not gas
-    // efficient for large communities but suffices for a simplified demo. A
-    // more scalable design would use a snapshot‑based or merkle tree
-    // mechanism.
+    // List of current token holders. Historically this contract maintained a
+    // simple array of holders and iterated through it to redistribute balances.
+    // This design was vulnerable to denial‑of‑service attacks because a
+    // malicious actor could fragment the coin into many tiny balances,
+    // causing on‑chain loops to exhaust gas. In this improved version, the
+    // holders array still tracks addresses for informational purposes, but
+    // seized balances are returned to the reserve instead of being
+    // redistributed on‑chain. We also track each holder’s index to enable
+    // O(1) removal when their balance drops to zero.
     address[] private holders;
     mapping(address => bool) private isHolder;
+    mapping(address => uint256) private holderIndex;
 
     // Mapping of flagged addresses that are considered non‑human. Once
     // flagged, an address cannot receive tokens and its balance will be
@@ -68,6 +73,14 @@ contract DoomsdayCoin {
     event Approval(address indexed owner, address indexed spender, uint256 value);
     event Flagged(address indexed account, uint256 balanceRedistributed);
     event SharesReleased(address indexed to, uint256 amount);
+
+    /**
+     * @dev Event emitted when seized tokens are returned to the reserve. In the
+     * improved contract, flagged or deceased accounts have their balances
+     * added back to the reserve instead of being redistributed on‑chain to
+     * avoid expensive loops.
+     */
+    event TokensSeized(address indexed account, uint256 amount);
 
     /**
      * @dev Initialize the contract, setting the deployer as admin and
@@ -102,8 +115,30 @@ contract DoomsdayCoin {
     function _addHolder(address account) internal {
         if (!isHolder[account]) {
             isHolder[account] = true;
+            holderIndex[account] = holders.length;
             holders.push(account);
         }
+    }
+
+    /**
+     * @dev Internal function to remove a holder from the list when their
+     * balance becomes zero. Uses the holderIndex mapping to swap and pop in
+     * O(1) time.
+     */
+    function _removeHolder(address account) internal {
+        if (!isHolder[account]) {
+            return;
+        }
+        uint256 index = holderIndex[account];
+        uint256 lastIndex = holders.length - 1;
+        address lastHolder = holders[lastIndex];
+        // Move the last holder into the spot to delete
+        holders[index] = lastHolder;
+        holderIndex[lastHolder] = index;
+        // Remove the last element
+        holders.pop();
+        isHolder[account] = false;
+        // Note: holderIndex[account] retains its old value but is ignored
     }
 
     /**
@@ -122,7 +157,12 @@ contract DoomsdayCoin {
 
         balances[msg.sender] -= value;
         balances[to] += value;
-        _addHolder(to);
+        if (!isHolder[to]) {
+            _addHolder(to);
+        }
+        if (balances[msg.sender] == 0) {
+            _removeHolder(msg.sender);
+        }
         emit Transfer(msg.sender, to, value);
         return true;
     }
@@ -155,7 +195,12 @@ contract DoomsdayCoin {
         allowances[from][msg.sender] -= value;
         balances[from] -= value;
         balances[to] += value;
-        _addHolder(to);
+        if (!isHolder[to]) {
+            _addHolder(to);
+        }
+        if (balances[from] == 0) {
+            _removeHolder(from);
+        }
         emit Transfer(from, to, value);
         return true;
     }
@@ -184,7 +229,9 @@ contract DoomsdayCoin {
 
         reserve -= amount;
         balances[to] += amount;
-        _addHolder(to);
+        if (!isHolder[to]) {
+            _addHolder(to);
+        }
         emit SharesReleased(to, amount);
         emit Transfer(address(0), to, amount);
     }
@@ -198,35 +245,16 @@ contract DoomsdayCoin {
      */
     function flagAccount(address account) external onlyAdmin {
         require(!flagged[account], "Account already flagged");
-        uint256 balanceToRedistribute = balances[account];
+        uint256 seized = balances[account];
         flagged[account] = true;
         balances[account] = 0;
-
-        // Sum the total balances of eligible accounts for redistribution
-        uint256 totalEligible = 0;
-        for (uint256 i = 0; i < holders.length; i++) {
-            address holder = holders[i];
-            if (!flagged[holder] && balances[holder] > 0) {
-                totalEligible += balances[holder];
-            }
+        if (seized > 0) {
+            reserve += seized;
+            emit TokensSeized(account, seized);
+            emit Transfer(account, address(0), seized);
         }
-
-        // Distribute the seized balance proportionally to eligible holders
-        if (balanceToRedistribute > 0 && totalEligible > 0) {
-            for (uint256 i = 0; i < holders.length; i++) {
-                address holder = holders[i];
-                if (!flagged[holder] && balances[holder] > 0) {
-                    uint256 share = (balanceToRedistribute * balances[holder]) / totalEligible;
-                    balances[holder] += share;
-                }
-            }
-        } else if (balanceToRedistribute > 0 && totalEligible == 0) {
-            // If no eligible holders exist, return seized tokens to reserve
-            reserve += balanceToRedistribute;
-        }
-
-        emit Flagged(account, balanceToRedistribute);
-        emit Transfer(account, address(0), balanceToRedistribute);
+        _removeHolder(account);
+        emit Flagged(account, seized);
     }
 
     /**
@@ -238,30 +266,17 @@ contract DoomsdayCoin {
      * @param account The deceased account
      */
     function redistributeOnDeath(address account) external onlyAdmin {
+        // A deceased account's balance is returned to the reserve. We do not
+        // redistribute on‑chain to avoid expensive loops. If the account is
+        // already flagged, it has been handled by flagAccount().
         require(!flagged[account], "Account already flagged");
-        uint256 balanceToRedistribute = balances[account];
+        uint256 seized = balances[account];
         balances[account] = 0;
-
-        uint256 totalEligible = 0;
-        for (uint256 i = 0; i < holders.length; i++) {
-            address holder = holders[i];
-            if (!flagged[holder] && balances[holder] > 0 && holder != account) {
-                totalEligible += balances[holder];
-            }
+        if (seized > 0) {
+            reserve += seized;
+            emit TokensSeized(account, seized);
+            emit Transfer(account, address(0), seized);
         }
-
-        if (balanceToRedistribute > 0 && totalEligible > 0) {
-            for (uint256 i = 0; i < holders.length; i++) {
-                address holder = holders[i];
-                if (!flagged[holder] && balances[holder] > 0 && holder != account) {
-                    uint256 share = (balanceToRedistribute * balances[holder]) / totalEligible;
-                    balances[holder] += share;
-                }
-            }
-        } else if (balanceToRedistribute > 0 && totalEligible == 0) {
-            reserve += balanceToRedistribute;
-        }
-
-        emit Transfer(account, address(0), balanceToRedistribute);
+        _removeHolder(account);
     }
 }
